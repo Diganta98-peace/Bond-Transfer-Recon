@@ -62,9 +62,95 @@ def _extract_demat(raw: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _read_csv_block(csv_bytes: bytes) -> pd.DataFrame:
-    """Reads report-style CSV text and extracts only the transaction table."""
-    text = csv_bytes.decode("utf-8", errors="replace")
+    """Reads report-style CSV bytes and extracts only the transaction table.
+
+    Robustness improvements:
+    - Tries multiple encodings (utf-8-sig, utf-16, latin-1)
+    - Detects header even if not quoted (POSTED DATE, ISIN, ...)
+    - Stops table at first blank line OR when a new report section begins
+    """
+    # Decode with fallbacks (some DP exports are UTF-16)
+    text = None
+    for enc in ("utf-8-sig", "utf-16", "utf-16le", "utf-16be", "latin-1"):
+        try:
+            text = csv_bytes.decode(enc)
+            # Heuristic: if we decoded UTF-16 but got lots of nulls, try next
+            if enc.startswith("utf-16") and "\x00" in text:
+                continue
+            break
+        except Exception:
+            continue
+    if text is None:
+        # last resort
+        text = csv_bytes.decode("utf-8", errors="replace")
+
     lines = text.splitlines()
+
+    # Find the real transaction table header line.
+    header_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip().lstrip("\ufeff")  # remove BOM if present
+        u = s.upper()
+        # accept both quoted and unquoted headers
+        if u.startswith('"POSTED DATE"') or u.startswith('POSTED DATE'):
+            header_idx = i
+            break
+        # fallback: if line contains key columns
+        if ("POSTED DATE" in u) and ("ISIN" in u) and ("TRANSACTION" in u):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            'Could not find the transaction table header. '
+            'Expected a line containing POSTED DATE and ISIN (quoted or unquoted).'
+        )
+
+    # Collect table lines until a terminator (blank line or next report section)
+    terminators = (
+        "STATEMENT OF HOLDINGS",
+        "STATEMENT OF HOLDING",
+        "HOLDINGS AS ON",
+        "DISCLAIMER",
+    )
+    table_lines = []
+    for j in range(header_idx, len(lines)):
+        s = lines[j].strip()
+        if s == "":  # blank line ends the table in most exports
+            break
+        if any(t in s.upper() for t in terminators):
+            break
+        table_lines.append(lines[j])
+
+    if len(table_lines) < 2:
+        raise ValueError("Transaction table header found, but no transaction rows detected under it.")
+
+    df = pd.read_csv(
+        io.StringIO("\n".join(table_lines)),
+        dtype=str,
+        engine="python",
+        on_bad_lines="skip"
+    )
+
+    rename_map = {
+        "POSTED DATE": "PostedDate",
+        "ISIN": "ISIN",
+        "TRANSACTION DESCRIPTION": "DematRaw",
+        "TRANSACTION UNITS": "Units",
+        "TRANSACTION DEBIT/CREDIT FLAG (D/C)": "DCFlag",
+    }
+    # normalize column names in case of extra spaces
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.rename(columns=rename_map)
+
+    needed = ["PostedDate", "ISIN", "DematRaw", "Units", "DCFlag"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        # show available columns to help debugging
+        raise ValueError(f"Transaction table parsed but missing expected columns: {missing}. Columns found: {list(df.columns)}")
+
+    return df[needed].copy()
+
 
     header_idx = None
     for i, line in enumerate(lines):
